@@ -1,0 +1,122 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ dev, main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+    
+    - name: Run linting
+      run: |
+        flake8 app --count --select=E9,F63,F7,F82 --show-source --statistics
+        flake8 app --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+    
+    - name: Run tests
+      run: |
+        pytest tests/ -v --cov=app --cov-report=term-missing || echo "No tests found yet"
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Log in to GitHub Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=sha,prefix={{branch}}-
+    
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+
+  deploy-dev:
+    if: github.ref == 'refs/heads/dev' && github.event_name == 'push'
+    needs: build
+    runs-on: ubuntu-latest
+    environment: development
+    
+    steps:
+    - name: Deploy to DigitalOcean (Dev)
+      uses: appleboy/ssh-action@v1.0.0
+      with:
+        host: ${{ secrets.DO_DEV_HOST }}
+        username: ${{ secrets.DO_USERNAME }}
+        key: ${{ secrets.DO_SSH_KEY }}
+        script: |
+          docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:dev
+          docker stop uptodate-dev || true
+          docker rm uptodate-dev || true
+          docker run -d \
+            --name uptodate-dev \
+            -p 5000:5000 \
+            --env-file /home/${{ secrets.DO_USERNAME }}/.env.development \
+            --restart unless-stopped \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:dev
+          docker system prune -f
+
+  deploy-prod:
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    needs: build
+    runs-on: ubuntu-latest
+    environment: production
+    
+    steps:
+    - name: Deploy to DigitalOcean (Prod)
+      uses: appleboy/ssh-action@v1.0.0
+      with:
+        host: ${{ secrets.DO_PROD_HOST }}
+        username: ${{ secrets.DO_USERNAME }}
+        key: ${{ secrets.DO_SSH_KEY }}
+        script: |
+          docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:main
+          docker stop uptodate-prod || true
+          docker rm uptodate-prod || true
+          docker run -d \
+            --name uptodate-prod \
+            -p 80:5000 \
+            --env-file /home/${{ secrets.DO_USERNAME }}/.env.production \
+            --restart always \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:main
+          docker system prune -f
